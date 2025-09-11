@@ -1,0 +1,19 @@
+# Ignore CMake build and configuration files
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+*.user
+*.workspace
+*.swp
+*.swo
+*.ninja
+*.log
+*.cmake
+Debug/
+Release/
+# STM32CubeMX generated files
+*.ioc
+# VSCode settings (optional, uncomment if desired)
+#.vscode/
