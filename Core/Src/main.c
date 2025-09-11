@@ -2,7 +2,15 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body
+  * @brief          : Main program body - Optimized Version
+  ******************************************************************************
+  * OPTIMIZATION NOTES:
+  * - Consolidated redundant timestamp variables into unified tracking
+  * - Created configuration tables for ADC management to reduce code duplication
+  * - Unified ADC callback processing with single function handling all instances
+  * - Consolidated error handling with table-driven approach
+  * - Simplified frequency and phase calculation logic
+  * - Reduced repetitive ADC initialization and monitoring code
   ******************************************************************************
   * @attention
   *
@@ -90,19 +98,11 @@ static const uint8_t HDR_FREQ_INFO[2] = {0xAA, 0xF0}; // Frequency and timing in
 
 static uint16_t seq16[CH_COUNT] = {0}; // todos os elementos inicializados com zero
 
-// Global timestamp and frequency tracking
-static volatile uint32_t global_timestamp = 0;  // Incremented every sample (7.68 kHz)
-static volatile uint32_t cycle_start_timestamp = 0; // Timestamp when cycle starts
-static uint16_t freq_info_seq = 0;
-
-// Global tick that advances once per TIM1 trigger (not per channel)
-static volatile uint32_t sample_tick = 0;           // increments once per TIM1 trigger
-static volatile uint8_t  tick_overflow = 0;         // Set to 1 when sample_tick overflows
-
-// Legacy counters for backward compatibility (kept for now)
-static volatile uint32_t global_sample_number = 0;  // Global sample counter (4 bytes)
-static volatile uint32_t cycle_start_sample = 0;    // Sample number when cycle starts
-static volatile uint8_t sample_overflow_flag = 0;   // Set to 1 when sample counter overflows
+// Unified timestamp tracking - removed redundant variables
+static volatile uint32_t sample_tick = 0;           // Global sample counter (main reference)
+static volatile uint32_t cycle_start_sample = 0;    // Sample when cycle starts
+static volatile uint8_t  tick_overflow = 0;         // Overflow flag
+static uint16_t freq_info_seq = 0;                  // Frequency info sequence
 
 
 /* USER CODE END PM */
@@ -411,9 +411,9 @@ static void send_freq_info(void) {
   pack_float(pllB.phase, &frame[pos]); pos += 4;
   pack_float(pllC.phase, &frame[pos]); pos += 4;
   
-  // Timestamp information (3 × 4 bytes = 12 bytes)
-  pack32(global_timestamp, &frame[pos]); pos += 4;
-  pack32(cycle_start_timestamp, &frame[pos]); pos += 4;
+  // Timestamp information (2 × 4 bytes = 8 bytes) - simplified
+  pack32(sample_tick, &frame[pos]); pos += 4;
+  pack32(cycle_start_sample, &frame[pos]); pos += 4;
   pack32(HAL_GetTick(), &frame[pos]); pos += 4; // System tick (ms)
   
   // ADC callback counts for diagnostics (4 × 4 bytes = 16 bytes)
@@ -458,14 +458,6 @@ static inline void push_sample(acq_channel_t ch, uint16_t s, uint8_t advance_tic
     uint32_t prev = sample_tick;
     sample_tick++;
     if (sample_tick == 0 && prev == 0xFFFFFFFFu) tick_overflow = 1;
-    
-    // Keep legacy counters for backward compatibility
-    global_timestamp++;
-    uint32_t prev_sample = global_sample_number;
-    global_sample_number++;
-    if (global_sample_number == 0 && prev_sample == 0xFFFFFFFFu) {
-      sample_overflow_flag = 1;
-    }
   }
 
   // Step the PLL only on voltage channels
@@ -485,9 +477,8 @@ static inline void push_sample(acq_channel_t ch, uint16_t s, uint8_t advance_tic
   if (b->i_cycle >= CYCLE_SAMPLES) {
     b->i_cycle = 0; b->seq_cycle++;
     
-    // Record timestamp and sample number when cycle starts (for synchronization)
-    cycle_start_timestamp = global_timestamp;
-    cycle_start_sample = sample_tick;  // Use the true global tick, not per-channel counter
+    // Record sample number when cycle starts
+    cycle_start_sample = sample_tick;
 
     // Monta frame 250 B deste canal e envia com header específico do canal
     uint8_t frame[FRAME_BYTES]; uint16_t pos=0;
@@ -503,37 +494,34 @@ static inline void push_sample(acq_channel_t ch, uint16_t s, uint8_t advance_tic
       tick_overflow = 0; // Clear flag after including in frame
     }
     
-    // Pack timestamp for backward compatibility (4 bytes)
-    pack32(cycle_start_timestamp, &frame[pos]); pos += 4;
+    // Pack timestamp for synchronization (4 bytes)
+    pack32(cycle_start_sample, &frame[pos]); pos += 4;
     
     // Pack all 128 samples (128 samples = 192 bytes when packed 2-in-3)
     for (uint16_t i = 0; i < CYCLE_SAMPLES; i += 2) {
       pack12_2in3(b->cycle[i], b->cycle[i+1], &frame[pos]); pos += 3;
     }
     
-    // Add frequency information for this channel's voltage (4 bytes)
+    // Get frequency for this channel
+    float channel_freq;
     if (ch == CH_VA) {
-      pack_float(pll_inst_freq_hz(&pllA), &frame[pos]); pos += 4;
+      channel_freq = pll_inst_freq_hz(&pllA);
     } else if (ch == CH_VB) {
-      pack_float(pll_inst_freq_hz(&pllB), &frame[pos]); pos += 4;
+      channel_freq = pll_inst_freq_hz(&pllB);
     } else if (ch == CH_VC) {
-      pack_float(pll_inst_freq_hz(&pllC), &frame[pos]); pos += 4;
+      channel_freq = pll_inst_freq_hz(&pllC);
     } else {
       // For current channels, use average frequency
-      float avg_freq = (pll_inst_freq_hz(&pllA) + pll_inst_freq_hz(&pllB) + pll_inst_freq_hz(&pllC)) / 3.0f;
-      pack_float(avg_freq, &frame[pos]); pos += 4;
+      channel_freq = (pll_inst_freq_hz(&pllA) + pll_inst_freq_hz(&pllB) + pll_inst_freq_hz(&pllC)) / 3.0f;
     }
+    pack_float(channel_freq, &frame[pos]); pos += 4;
     
     // Add phase information (4 bytes)
-    if (ch == CH_VA) {
-      pack_float(pllA.phase, &frame[pos]); pos += 4;
-    } else if (ch == CH_VB) {
-      pack_float(pllB.phase, &frame[pos]); pos += 4;
-    } else if (ch == CH_VC) {
-      pack_float(pllC.phase, &frame[pos]); pos += 4;
-    } else {
-      pack_float(0.0f, &frame[pos]); pos += 4; // Current channels don't have phase
-    }
+    float channel_phase = 0.0f;
+    if (ch == CH_VA) channel_phase = pllA.phase;
+    else if (ch == CH_VB) channel_phase = pllB.phase;  
+    else if (ch == CH_VC) channel_phase = pllC.phase;
+    pack_float(channel_phase, &frame[pos]); pos += 4;
     
     // Fill remaining space before footer
     while (pos < FRAME_BYTES - 6) {
@@ -620,11 +608,11 @@ int main(void)
   MX_UART4_Init();
   /* USER CODE BEGIN 2 */
 
-  // Calibração dos ADCs
-  HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
-  HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED);
-  HAL_ADCEx_Calibration_Start(&hadc3, ADC_SINGLE_ENDED);
-  HAL_ADCEx_Calibration_Start(&hadc4, ADC_SINGLE_ENDED);
+  // Calibrate all ADCs in a loop
+  ADC_HandleTypeDef* adcs[] = {&hadc1, &hadc2, &hadc3, &hadc4};
+  for (int i = 0; i < 4; i++) {
+    HAL_ADCEx_Calibration_Start(adcs[i], ADC_SINGLE_ENDED);
+  }
 
   // Reconfigure TIM1 to exact 7.68 kHz TRGO (overrides CubeMX defaults)
   TIM1_Config_TRGO_7680Hz();
@@ -639,15 +627,21 @@ int main(void)
   // Start the trigger timer first
   HAL_TIM_Base_Start(&htim1);
 
-  // Start your ADC DMAs and check return status
-  HAL_StatusTypeDef status1 = HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc1_dma, 2u * 2u * DMA_TRIG_HALF);
-  HAL_StatusTypeDef status2 = HAL_ADC_Start_DMA(&hadc2, (uint32_t*)adc2_dma, 2u * 2u * DMA_TRIG_HALF);
-  HAL_StatusTypeDef status3 = HAL_ADC_Start_DMA(&hadc3, (uint32_t*)adc3_dma, 2u * 2u * DMA_TRIG_HALF);
-  HAL_StatusTypeDef status4 = HAL_ADC_Start_DMA(&hadc4, (uint32_t*)adc4_dma, 2u * 1u * DMA_TRIG_HALF);
+  // Start ADC DMAs with unified configuration
+  HAL_StatusTypeDef adc_status[4];
+  const uint16_t dma_sizes[] = {2u * 2u * DMA_TRIG_HALF, 2u * 2u * DMA_TRIG_HALF, 
+                                2u * 2u * DMA_TRIG_HALF, 2u * 1u * DMA_TRIG_HALF};
+  uint32_t* dma_buffers[] = {(uint32_t*)adc1_dma, (uint32_t*)adc2_dma, 
+                             (uint32_t*)adc3_dma, (uint32_t*)adc4_dma};
   
-  // Send debug info about ADC start status
-  uint8_t debug_msg[100];
-  sprintf((char*)debug_msg, "ADC Start Status: 1=%d 2=%d 3=%d 4=%d\r\n", status1, status2, status3, status4);
+  for (int i = 0; i < 4; i++) {
+    adc_status[i] = HAL_ADC_Start_DMA(adcs[i], dma_buffers[i], dma_sizes[i]);
+  }
+  
+  // Send unified debug info
+  uint8_t debug_msg[120];
+  sprintf((char*)debug_msg, "ADC Start Status: 1=%d 2=%d 3=%d 4=%d\r\n", 
+          adc_status[0], adc_status[1], adc_status[2], adc_status[3]);
   HAL_UART_Transmit(&huart4, debug_msg, strlen((char*)debug_msg), 1000);
   
   // Also send ADC register status for debugging
@@ -674,11 +668,12 @@ int main(void)
   
   // Reset counters
   
-  // Manual software trigger test
-  HAL_ADC_Start(&hadc1); HAL_ADC_PollForConversion(&hadc1, 100); HAL_ADC_Stop(&hadc1);
-  HAL_ADC_Start(&hadc2); HAL_ADC_PollForConversion(&hadc2, 100); HAL_ADC_Stop(&hadc2);  
-  HAL_ADC_Start(&hadc3); HAL_ADC_PollForConversion(&hadc3, 100); HAL_ADC_Stop(&hadc3);
-  HAL_ADC_Start(&hadc4); HAL_ADC_PollForConversion(&hadc4, 100); HAL_ADC_Stop(&hadc4);
+  // Manual software trigger test (simplified)
+  for (int i = 0; i < 4; i++) {
+    HAL_ADC_Start(adcs[i]); 
+    HAL_ADC_PollForConversion(adcs[i], 100); 
+    HAL_ADC_Stop(adcs[i]);
+  }
   
   sprintf((char*)debug_msg, "Manual test - ADC values: 1=%d 2=%d 3=%d 4=%d\r\n", 
           (int)HAL_ADC_GetValue(&hadc1), (int)HAL_ADC_GetValue(&hadc2), 
@@ -690,7 +685,8 @@ int main(void)
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   static uint32_t heartbeat = 0;
-  static uint32_t last_adc1_count = 0, last_adc2_count = 0, last_adc3_count = 0, last_adc4_count = 0;
+  static uint32_t last_counts[4] = {0};
+  volatile uint32_t* cb_counts[] = {&adc1_cb_count, &adc2_cb_count, &adc3_cb_count, &adc4_cb_count};
   
   while (1)
   {
@@ -702,17 +698,16 @@ int main(void)
     if (++heartbeat >= 500000) {  // Check every ~0.5 seconds
       heartbeat = 0;
       
-      // Check if ADC counters have stopped incrementing
+      // Check if any ADC counters have stopped incrementing
       uint8_t adc_stuck = 0;
-      if (adc1_cb_count == last_adc1_count) adc_stuck |= 0x01;
-      if (adc2_cb_count == last_adc2_count) adc_stuck |= 0x02;
-      if (adc3_cb_count == last_adc3_count) adc_stuck |= 0x04;
-      if (adc4_cb_count == last_adc4_count) adc_stuck |= 0x08;
+      for (int i = 0; i < 4; i++) {
+        if (*cb_counts[i] == last_counts[i]) adc_stuck |= (1 << i);
+      }
       
       // Send status message
       uint8_t status_msg[150];
       sprintf((char*)status_msg, "ADC Status: 1=%lu 2=%lu 3=%lu 4=%lu Stuck=0x%02X\r\n", 
-              adc1_cb_count, adc2_cb_count, adc3_cb_count, adc4_cb_count, adc_stuck);
+              *cb_counts[0], *cb_counts[1], *cb_counts[2], *cb_counts[3], adc_stuck);
       HAL_UART_Transmit(&huart4, status_msg, strlen((char*)status_msg), 1000);
       
       // If any ADC is stuck, try to recover
@@ -720,34 +715,20 @@ int main(void)
         uint8_t recovery_msg[] = "ADC Recovery: Restarting stuck ADCs...\r\n";
         HAL_UART_Transmit(&huart4, recovery_msg, sizeof(recovery_msg)-1, 1000);
         
-        // Stop and restart stuck ADCs
-        if (adc_stuck & 0x01) {
-          HAL_ADC_Stop_DMA(&hadc1);
-          HAL_Delay(10);
-          HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc1_dma, 2u * 2u * DMA_TRIG_HALF);
-        }
-        if (adc_stuck & 0x02) {
-          HAL_ADC_Stop_DMA(&hadc2);
-          HAL_Delay(10);
-          HAL_ADC_Start_DMA(&hadc2, (uint32_t*)adc2_dma, 2u * 2u * DMA_TRIG_HALF);
-        }
-        if (adc_stuck & 0x04) {
-          HAL_ADC_Stop_DMA(&hadc3);
-          HAL_Delay(10);
-          HAL_ADC_Start_DMA(&hadc3, (uint32_t*)adc3_dma, 2u * 2u * DMA_TRIG_HALF);
-        }
-        if (adc_stuck & 0x08) {
-          HAL_ADC_Stop_DMA(&hadc4);
-          HAL_Delay(10);
-          HAL_ADC_Start_DMA(&hadc4, (uint32_t*)adc4_dma, 2u * 1u * DMA_TRIG_HALF);
+        // Restart stuck ADCs
+        for (int i = 0; i < 4; i++) {
+          if (adc_stuck & (1 << i)) {
+            HAL_ADC_Stop_DMA(adcs[i]);
+            HAL_Delay(10);
+            HAL_ADC_Start_DMA(adcs[i], dma_buffers[i], dma_sizes[i]);
+          }
         }
       }
       
       // Update last counts for next check
-      last_adc1_count = adc1_cb_count;
-      last_adc2_count = adc2_cb_count;
-      last_adc3_count = adc3_cb_count;
-      last_adc4_count = adc4_cb_count;
+      for (int i = 0; i < 4; i++) {
+        last_counts[i] = *cb_counts[i];
+      }
     }
 
     // Keep TX running
@@ -1258,50 +1239,42 @@ static void MX_GPIO_Init(void)
 
 // Debug counters to track ADC callbacks
 
+// Unified ADC callback processing
+typedef struct {
+  ADC_TypeDef* instance;
+  uint16_t* dma_buffer;
+  volatile uint32_t* cb_count;
+  const acq_channel_t* channel_map;
+  uint8_t num_channels;
+} adc_config_t;
+
+static const adc_config_t adc_configs[4] = {
+  {ADC1, adc1_dma, &adc1_cb_count, (const acq_channel_t[]){CH_VA, CH_IA}, 2},
+  {ADC2, adc2_dma, &adc2_cb_count, (const acq_channel_t[]){CH_VB, CH_IB}, 2},
+  {ADC3, adc3_dma, &adc3_cb_count, (const acq_channel_t[]){CH_VC, CH_IC}, 2},
+  {ADC4, adc4_dma, &adc4_cb_count, (const acq_channel_t[]){CH_IN}, 1}
+};
+
+static void process_adc_callback(ADC_HandleTypeDef* hadc, uint16_t buffer_offset) {
+  for (int i = 0; i < 4; i++) {
+    if (hadc->Instance == adc_configs[i].instance) {
+      (*adc_configs[i].cb_count)++;
+      demux_block(&adc_configs[i].dma_buffer[buffer_offset], 
+                  DMA_TRIG_HALF, adc_configs[i].channel_map, adc_configs[i].num_channels);
+      return;
+    }
+  }
+}
+
 void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef* hadc)
 {
-  if (hadc->Instance == ADC1) {
-    adc1_cb_count++;
-    const acq_channel_t map[2] = { CH_VA, CH_IA };
-    demux_block(adc1_dma, DMA_TRIG_HALF, map, 2);
-  } else if (hadc->Instance == ADC2) {
-    adc2_cb_count++;
-    const acq_channel_t map[2] = { CH_VB, CH_IB };
-    demux_block(adc2_dma, DMA_TRIG_HALF, map, 2);
-  } else if (hadc->Instance == ADC3) {
-    adc3_cb_count++;
-    const acq_channel_t map[2] = { CH_VC, CH_IC };
-    demux_block(adc3_dma, DMA_TRIG_HALF, map, 2);
-  } else if (hadc->Instance == ADC4) {
-    adc4_cb_count++;
-    const acq_channel_t map[1] = { CH_IN };
-    demux_block(adc4_dma, DMA_TRIG_HALF, map, 1);
-  }
+  process_adc_callback(hadc, 0);
 }
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 {
-  if (hadc->Instance == ADC1) {
-    adc1_cb_count++;
-    const acq_channel_t map[2] = { CH_VA, CH_IA };
-    demux_block(&adc1_dma[2*DMA_TRIG_HALF], DMA_TRIG_HALF, map, 2);
-    // ADC1 now uses DMA_CIRCULAR mode - no restart needed
-  } else if (hadc->Instance == ADC2) {
-    adc2_cb_count++;
-    const acq_channel_t map[2] = { CH_VB, CH_IB };
-    demux_block(&adc2_dma[2*DMA_TRIG_HALF], DMA_TRIG_HALF, map, 2);
-    // ADC2 now uses DMA_CIRCULAR mode - no restart needed
-  } else if (hadc->Instance == ADC3) {
-    adc3_cb_count++;
-    const acq_channel_t map[2] = { CH_VC, CH_IC };
-    demux_block(&adc3_dma[2*DMA_TRIG_HALF], DMA_TRIG_HALF, map, 2);
-    // ADC3 uses DMA_CIRCULAR mode - no restart needed
-  } else if (hadc->Instance == ADC4) {
-    adc4_cb_count++;
-    const acq_channel_t map[1] = { CH_IN };
-    demux_block(&adc4_dma[1*DMA_TRIG_HALF], DMA_TRIG_HALF, map, 1);
-    // ADC4 now uses DMA_CIRCULAR mode - no restart needed
-  }
+  uint16_t offset = (hadc->Instance == ADC4) ? 1*DMA_TRIG_HALF : 2*DMA_TRIG_HALF;
+  process_adc_callback(hadc, offset);
 }
 
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
@@ -1314,60 +1287,61 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
   TX_Kick();
 }
 
-// Error callback handlers
+// Unified error handling
+typedef struct {
+  ADC_TypeDef* instance;
+  ADC_HandleTypeDef* handle;
+  uint32_t* dma_buffer;
+  uint16_t buffer_size;
+} adc_restart_config_t;
+
+static const adc_restart_config_t restart_configs[4] = {
+  {ADC1, &hadc1, (uint32_t*)adc1_dma, 2u * 2u * DMA_TRIG_HALF},
+  {ADC2, &hadc2, (uint32_t*)adc2_dma, 2u * 2u * DMA_TRIG_HALF},
+  {ADC3, &hadc3, (uint32_t*)adc3_dma, 2u * 2u * DMA_TRIG_HALF},
+  {ADC4, &hadc4, (uint32_t*)adc4_dma, 2u * 1u * DMA_TRIG_HALF}
+};
+
+static void send_error_msg(const char* prefix, uint32_t instance, uint32_t error_code) {
+  uint8_t error_msg[80];
+  sprintf((char*)error_msg, "%s Error: Instance=0x%08lX ErrorCode=0x%08lX\r\n", 
+          prefix, instance, error_code);
+  HAL_UART_Transmit(&huart4, error_msg, strlen((char*)error_msg), 1000);
+}
+
+static void restart_adc_by_instance(ADC_TypeDef* instance) {
+  for (int i = 0; i < 4; i++) {
+    if (restart_configs[i].instance == instance) {
+      HAL_ADC_Stop_DMA(restart_configs[i].handle);
+      HAL_Delay(10);
+      HAL_ADC_Start_DMA(restart_configs[i].handle, restart_configs[i].dma_buffer, 
+                        restart_configs[i].buffer_size);
+      break;
+    }
+  }
+}
+
 void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc)
 {
-  // Send error message via UART
-  uint8_t error_msg[80];
-  sprintf((char*)error_msg, "ADC Error: Instance=0x%08lX ErrorCode=0x%08lX\r\n", 
-          (uint32_t)hadc->Instance, hadc->ErrorCode);
-  HAL_UART_Transmit(&huart4, error_msg, strlen((char*)error_msg), 1000);
-  
-  // Try to restart the failed ADC
-  if (hadc->Instance == ADC1) {
-    HAL_ADC_Stop_DMA(&hadc1);
-    HAL_Delay(10);
-    HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc1_dma, 2u * 2u * DMA_TRIG_HALF);
-  } else if (hadc->Instance == ADC2) {
-    HAL_ADC_Stop_DMA(&hadc2);
-    HAL_Delay(10);
-    HAL_ADC_Start_DMA(&hadc2, (uint32_t*)adc2_dma, 2u * 2u * DMA_TRIG_HALF);
-  } else if (hadc->Instance == ADC3) {
-    HAL_ADC_Stop_DMA(&hadc3);
-    HAL_Delay(10);
-    HAL_ADC_Start_DMA(&hadc3, (uint32_t*)adc3_dma, 2u * 2u * DMA_TRIG_HALF);
-  } else if (hadc->Instance == ADC4) {
-    HAL_ADC_Stop_DMA(&hadc4);
-    HAL_Delay(10);
-    HAL_ADC_Start_DMA(&hadc4, (uint32_t*)adc4_dma, 2u * 1u * DMA_TRIG_HALF);
-  }
+  send_error_msg("ADC", (uint32_t)hadc->Instance, hadc->ErrorCode);
+  restart_adc_by_instance(hadc->Instance);
 }
 
 void HAL_DMA_ErrorCallback(DMA_HandleTypeDef *hdma)
 {
-  // Send DMA error message
-  uint8_t error_msg[80];
-  sprintf((char*)error_msg, "DMA Error: Instance=0x%08lX ErrorCode=0x%08lX\r\n", 
-          (uint32_t)hdma->Instance, hdma->ErrorCode);
-  HAL_UART_Transmit(&huart4, error_msg, strlen((char*)error_msg), 1000);
+  send_error_msg("DMA", (uint32_t)hdma->Instance, hdma->ErrorCode);
   
-  // Try to restart the associated ADC
-  if (hdma->Instance == DMA1_Channel1) {      // ADC3
-    HAL_ADC_Stop_DMA(&hadc3);
-    HAL_Delay(10);
-    HAL_ADC_Start_DMA(&hadc3, (uint32_t*)adc3_dma, 2u * 2u * DMA_TRIG_HALF);
-  } else if (hdma->Instance == DMA1_Channel2) { // ADC1
-    HAL_ADC_Stop_DMA(&hadc1);
-    HAL_Delay(10);
-    HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc1_dma, 2u * 2u * DMA_TRIG_HALF);
-  } else if (hdma->Instance == DMA1_Channel3) { // ADC2
-    HAL_ADC_Stop_DMA(&hadc2);
-    HAL_Delay(10);
-    HAL_ADC_Start_DMA(&hadc2, (uint32_t*)adc2_dma, 2u * 2u * DMA_TRIG_HALF);
-  } else if (hdma->Instance == DMA1_Channel4) { // ADC4
-    HAL_ADC_Stop_DMA(&hadc4);
-    HAL_Delay(10);
-    HAL_ADC_Start_DMA(&hadc4, (uint32_t*)adc4_dma, 2u * 1u * DMA_TRIG_HALF);
+  // Map DMA channels to ADC instances
+  static const struct { DMA_Channel_TypeDef* dma; ADC_TypeDef* adc; } dma_to_adc[] = {
+    {DMA1_Channel1, ADC3}, {DMA1_Channel2, ADC1}, 
+    {DMA1_Channel3, ADC2}, {DMA1_Channel4, ADC4}
+  };
+  
+  for (int i = 0; i < 4; i++) {
+    if (hdma->Instance == dma_to_adc[i].dma) {
+      restart_adc_by_instance(dma_to_adc[i].adc);
+      break;
+    }
   }
 }
 

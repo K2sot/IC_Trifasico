@@ -13,7 +13,6 @@ compile_commands.json
 *.cmake
 Debug/
 Release/
-# STM32CubeMX generated files
-*.ioc
+
 # VSCode settings (optional, uncomment if desired)
-#.vscode/
+.vscode/
